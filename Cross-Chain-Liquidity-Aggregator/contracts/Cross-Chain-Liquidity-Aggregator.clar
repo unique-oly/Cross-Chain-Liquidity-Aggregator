@@ -282,3 +282,11 @@
   )
 )
 
+;; User position and analytics functions
+(define-read-only (get-user-liquidity-position (user principal) (pool-id uint))
+  (map-get? pool-providers { pool-id: pool-id, provider: user })
+)
+
+(define-read-only (get-user-deposit (user principal) (token principal))
+  (map-get? user-deposits { user: user, token: token })
+)
