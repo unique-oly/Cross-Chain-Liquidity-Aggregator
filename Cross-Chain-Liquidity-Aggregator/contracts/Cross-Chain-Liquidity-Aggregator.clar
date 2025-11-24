@@ -505,3 +505,209 @@
     confirmation-blocks: uint
   }
 )
+
+;; NEW COUNTERS
+(define-data-var next-loan-id uint u1)
+(define-data-var next-farm-id uint u1)
+(define-data-var next-proposal-id uint u1)
+(define-data-var next-policy-id uint u1)
+(define-data-var next-claim-id uint u1)
+(define-data-var next-nft-id uint u1)
+(define-data-var next-bridge-tx-id uint u1)
+(define-data-var next-oracle-feed-id uint u1)
+
+;; LENDING & BORROWING SYSTEM
+(define-public (create-lending-pool 
+  (token principal) 
+  (collateral-factor uint) 
+  (liquidation-threshold uint)
+)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (is-token-whitelisted token) ERR-INVALID-TOKEN)
+    (asserts! (<= collateral-factor u8000) ERR-INVALID-AMOUNT) ;; Max 80% collateral factor
+    (asserts! (<= liquidation-threshold u9000) ERR-INVALID-AMOUNT) ;; Max 90% liquidation threshold
+    
+    (map-set lending-pools
+      { token: token }
+      {
+        total-supplied: u0,
+        total-borrowed: u0,
+        supply-rate: u500, ;; 5% default
+        borrow-rate: u800, ;; 8% default
+        collateral-factor: collateral-factor,
+        liquidation-threshold: liquidation-threshold,
+        is-active: true
+      }
+    )
+    (ok token)
+  )
+)
+
+
+(define-public (supply-to-lending-pool (token principal) (amount uint))
+  (let
+    (
+      (pool (unwrap! (map-get? lending-pools { token: token }) ERR-POOL-NOT-FOUND))
+      (current-supply (default-to { amount: u0, earned-interest: u0, last-update-time: u0 } 
+                       (map-get? user-supplies { user: tx-sender, token: token })))
+    )
+    (asserts! (get is-active pool) ERR-PROTOCOL-PAUSED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    
+    ;; Update user supply
+    (map-set user-supplies
+      { user: tx-sender, token: token }
+      {
+        amount: (+ (get amount current-supply) amount),
+        earned-interest: (get earned-interest current-supply),
+        last-update-time: stacks-block-height
+      }
+    )
+    
+    ;; Update pool totals
+    (map-set lending-pools
+      { token: token }
+      (merge pool { total-supplied: (+ (get total-supplied pool) amount) })
+    )
+    
+    (ok amount)
+  )
+)
+
+(define-read-only (get-loan (loan-id uint))
+  (map-get? user-loans { loan-id: loan-id })
+)
+
+(define-read-only (get-lending-pool (token principal))
+  (map-get? lending-pools { token: token })
+)
+
+;; PRICE ORACLE SYSTEM
+(define-public (add-price-oracle 
+  (token principal) 
+  (initial-price uint) 
+  (decimals uint) 
+  (oracle-address principal)
+)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (is-token-whitelisted token) ERR-INVALID-TOKEN)
+    
+    (map-set price-oracles
+      { token: token }
+      {
+        price: initial-price,
+        decimals: decimals,
+        last-update-time: stacks-block-height,
+        oracle-address: oracle-address,
+        is-active: true
+      }
+    )
+    (ok token)
+  )
+)
+
+(define-public (update-token-price (token principal) (new-price uint))
+  (let
+    (
+      (oracle (unwrap! (map-get? price-oracles { token: token }) ERR-ORACLE-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender (get oracle-address oracle)) ERR-NOT-AUTHORIZED)
+    (asserts! (get is-active oracle) ERR-ORACLE-NOT-FOUND)
+    
+    (map-set price-oracles
+      { token: token }
+      (merge oracle { 
+        price: new-price,
+        last-update-time: stacks-block-height
+      })
+    )
+    (ok new-price)
+  )
+)
+
+(define-read-only (get-token-price (token principal))
+  (default-to u100000000 ;; Default price if oracle not found
+    (get price (map-get? price-oracles { token: token })))
+)
+
+(define-read-only (is-price-fresh (token principal) (max-age uint))
+  (let
+    (
+      (oracle (map-get? price-oracles { token: token }))
+    )
+    (match oracle
+      oracle-data (< (- stacks-block-height (get last-update-time oracle-data)) max-age)
+      false
+    )
+  )
+)
+
+;; YIELD FARMING & STAKING
+(define-public (create-farming-pool
+  (name (string-ascii 32))
+  (staking-token principal)
+  (reward-token principal)
+  (reward-rate uint)
+  (duration uint)
+)
+  (let
+    (
+      (farm-id (var-get next-farm-id))
+      (start-time stacks-block-height)
+      (end-time (+ stacks-block-height duration))
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (is-token-whitelisted staking-token) ERR-INVALID-TOKEN)
+    (asserts! (is-token-whitelisted reward-token) ERR-INVALID-TOKEN)
+    
+    (map-set farming-pools
+      { farm-id: farm-id }
+      {
+        name: name,
+        staking-token: staking-token,
+        reward-token: reward-token,
+        total-staked: u0,
+        reward-rate: reward-rate,
+        start-time: start-time,
+        end-time: end-time,
+        is-active: true
+      }
+    )
+    
+    (var-set next-farm-id (+ farm-id u1))
+    (ok farm-id)
+  )
+)
+
+(define-public (stake-in-farm (farm-id uint) (amount uint) (lock-period uint))
+  (let
+    (
+      (farm (unwrap! (map-get? farming-pools { farm-id: farm-id }) ERR-POOL-NOT-FOUND))
+      (current-stake (default-to { staked-amount: u0, reward-debt: u0, last-stake-time: u0, lock-end-time: u0 }
+                      (map-get? user-stakes { user: tx-sender, farm-id: farm-id })))
+    )
+    (asserts! (get is-active farm) ERR-FARMING-NOT-ACTIVE)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (<= stacks-block-height (get end-time farm)) ERR-DEADLINE-PASSED)
+    
+    (map-set user-stakes
+      { user: tx-sender, farm-id: farm-id }
+      {
+        staked-amount: (+ (get staked-amount current-stake) amount),
+        reward-debt: u0,
+        last-stake-time: stacks-block-height,
+        lock-end-time: (+ stacks-block-height lock-period)
+      }
+    )
+    
+    (map-set farming-pools
+      { farm-id: farm-id }
+      (merge farm { total-staked: (+ (get total-staked farm) amount) })
+    )
+    
+    (var-set total-staked-tokens (+ (var-get total-staked-tokens) amount))
+    (ok amount)
+  )
+)
